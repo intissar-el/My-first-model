@@ -3,36 +3,33 @@ import numpy as np
 import h5py
 import json
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 from collections import Counter
 from random import seed, choice, sample
 import pickle
+import math
 
-def create_input_files(dataset,karpathy_json_path,captions_per_image, min_word_freq,output_folder,max_len=100):
+def create_input_files(dataset, karpathy_json_path, captions_per_image, min_word_freq, output_folder, max_len=150):
     """
     Creates input files for training, validation, and test data.
-
-    :param dataset: name of dataset. Since bottom up features only available for coco, we use only coco
-    :param karpathy_json_path: path of Karpathy JSON file with splits and captions
-    :param captions_per_image: number of captions to sample per image
-    :param min_word_freq: words occuring less frequently than this threshold are binned as <unk>s
-    :param output_folder: folder to save files
-    :param max_len: don't sample captions longer than this length
+    Modifications pour Transformer :
+    - Augmentation de max_len à 150 (meilleure gestion des longues séquences)
+    - Ajout de tokens spéciaux pour les Transformers
     """
-
-    assert dataset in {'coco'}
+    assert dataset in {'coco', 'flickr8k', 'flickr30k'}
 
     # Read Karpathy JSON
     with open(karpathy_json_path, 'r') as j:
         data = json.load(j)
     
-    with open(os.path.join(output_folder,'train36_imgid2idx.pkl'), 'rb') as j:
+    # Chargement des features images
+    with open(os.path.join(output_folder, 'train36_imgid2idx.pkl'), 'rb') as j:
         train_data = pickle.load(j)
-        
-    with open(os.path.join(output_folder,'val36_imgid2idx.pkl'), 'rb') as j:
+    with open(os.path.join(output_folder, 'val36_imgid2idx.pkl'), 'rb') as j:
         val_data = pickle.load(j)
-    
-    # Read image paths and captions for each image
+
+    # Initialisation des structures de données
     train_image_captions = []
     val_image_captions = []
     test_image_captions = []
@@ -40,187 +37,242 @@ def create_input_files(dataset,karpathy_json_path,captions_per_image, min_word_f
     val_image_det = []
     test_image_det = []
     word_freq = Counter()
-    
+
+    # Nouveau : compteur pour statistiques
+    total_captions = 0
+    discarded_captions = 0
+
     for img in data['images']:
         captions = []
         for c in img['sentences']:
-            # Update word frequency
+            total_captions += 1
+            if len(c['tokens']) > max_len:
+                discarded_captions += 1
+                continue
             word_freq.update(c['tokens'])
-            if len(c['tokens']) <= max_len:
-                captions.append(c['tokens'])
+            captions.append(c['tokens'])
 
-        if len(captions) == 0:
+        if not captions:
             continue
-        
-        image_id = img['filename'].split('_')[2]
-        image_id = int(image_id.lstrip("0").split('.')[0])
 
+        image_id = int(img['filename'].split('_')[2].lstrip("0").split('.')[0])
+
+        # Gestion des splits
         if img['split'] in {'train', 'restval'}:
-            if img['filepath'] == 'train2014':
-                if image_id in train_data:
-                    train_image_det.append(("t",train_data[image_id]))
-            else:
-                if image_id in val_data:
-                    train_image_det.append(("v",val_data[image_id]))
-            train_image_captions.append(captions)
-        elif img['split'] in {'val'}:
+            target_data = train_data if img['filepath'] == 'train2014' else val_data
+            if image_id in target_data:
+                prefix = 't' if img['filepath'] == 'train2014' else 'v'
+                train_image_det.append((prefix, target_data[image_id]))
+                train_image_captions.append(captions)
+        elif img['split'] == 'val':
             if image_id in val_data:
-                val_image_det.append(("v",val_data[image_id]))
-            val_image_captions.append(captions)
-        elif img['split'] in {'test'}:
+                val_image_det.append(("v", val_data[image_id]))
+                val_image_captions.append(captions)
+        elif img['split'] == 'test':
             if image_id in val_data:
-                test_image_det.append(("v",val_data[image_id]))
-            test_image_captions.append(captions)
+                test_image_det.append(("v", val_data[image_id]))
+                test_image_captions.append(captions)
 
-    # Sanity check
-    assert len(train_image_det) == len(train_image_captions)
-    assert len(val_image_det) == len(val_image_captions)
-    assert len(test_image_det) == len(test_image_captions)
+    # Nouveau : affichage des statistiques
+    print(f"Total captions: {total_captions}")
+    print(f"Discarded captions (length > {max_len}): {discarded_captions}")
+    print(f"Vocabulary size: {len(word_freq)}")
 
-    # Create word map
+    # Création du vocabulaire avec tokens supplémentaires pour les Transformers
     words = [w for w in word_freq.keys() if word_freq[w] > min_word_freq]
     word_map = {k: v + 1 for v, k in enumerate(words)}
-    word_map['<unk>'] = len(word_map) + 1
-    word_map['<start>'] = len(word_map) + 1
-    word_map['<end>'] = len(word_map) + 1
-    word_map['<pad>'] = 0
-   
-    # Create a base/root name for all output files
-    base_filename = dataset + '_' + str(captions_per_image) + '_cap_per_img_' + str(min_word_freq) + '_min_word_freq'
     
-    # Save word map to a JSON
+    # Tokens spéciaux
+    special_tokens = {
+        '<pad>': 0,
+        '<unk>': len(word_map) + 1,
+        '<start>': len(word_map) + 2,
+        '<end>': len(word_map) + 3,
+        '<mask>': len(word_map) + 4  # Nouveau : pour l'apprentissage auto-supervisé
+    }
+    word_map.update(special_tokens)
+
+    # Sauvegarde du vocabulaire
+    base_filename = f"{dataset}_{captions_per_image}_cap_per_img_{min_word_freq}_min_word_freq"
+    os.makedirs(output_folder, exist_ok=True)
+    
     with open(os.path.join(output_folder, 'WORDMAP_' + base_filename + '.json'), 'w') as j:
-        json.dump(word_map, j)
-        
-    
-    for impaths, imcaps, split in [(train_image_det, train_image_captions, 'TRAIN'),
-                                   (val_image_det, val_image_captions, 'VAL'),
-                                   (test_image_det, test_image_captions, 'TEST')]:
+        json.dump(word_map, j, indent=4)
+
+    # Fonction pour créer les données encodées
+    def process_split(impaths, imcaps, split_name):
         enc_captions = []
         caplens = []
         
-        for i, path in enumerate(tqdm(impaths)):
-            # Sample captions
-            if len(imcaps[i]) < captions_per_image:
-                captions = imcaps[i] + [choice(imcaps[i]) for _ in range(captions_per_image - len(imcaps[i]))]
+        for i, path in enumerate(tqdm(impaths, desc=f"Processing {split_name}")):
+            # Échantillonnage des légendes
+            available_captions = imcaps[i]
+            if len(available_captions) < captions_per_image:
+                captions = available_captions + [
+                    choice(available_captions) 
+                    for _ in range(captions_per_image - len(available_captions))
+                ]
             else:
-                captions = sample(imcaps[i], k=captions_per_image)
-                
-            # Sanity check
-            assert len(captions) == captions_per_image
+                captions = sample(available_captions, k=captions_per_image)
             
-            for j, c in enumerate(captions):
-                # Encode captions
-                enc_c = [word_map['<start>']] + [word_map.get(word, word_map['<unk>']) for word in c] + [
-                    word_map['<end>']] + [word_map['<pad>']] * (max_len - len(c))
-
-                # Find caption lengths
-                c_len = len(c) + 2
-
+            # Encodage
+            for c in captions:
+                enc_c = [word_map['<start>']] + \
+                       [word_map.get(word, word_map['<unk>']) for word in c] + \
+                       [word_map['<end>']] + \
+                       [word_map['<pad>']] * (max_len - len(c))
+                
                 enc_captions.append(enc_c)
-                caplens.append(c_len)
-        
-        # Save encoded captions and their lengths to JSON files
-        with open(os.path.join(output_folder, split + '_CAPTIONS_' + base_filename + '.json'), 'w') as j:
+                caplens.append(len(c) + 2)  # +2 pour <start> et <end>
+
+        # Sauvegarde
+        with open(os.path.join(output_folder, split_name + '_CAPTIONS_' + base_filename + '.json'), 'w') as j:
             json.dump(enc_captions, j)
-
-        with open(os.path.join(output_folder, split + '_CAPLENS_' + base_filename + '.json'), 'w') as j:
+        
+        with open(os.path.join(output_folder, split_name + '_CAPLENS_' + base_filename + '.json'), 'w') as j:
             json.dump(caplens, j)
-    
-    # Save bottom up features indexing to JSON files
-    with open(os.path.join(output_folder, 'TRAIN' + '_GENOME_DETS_' + base_filename + '.json'), 'w') as j:
-        json.dump(train_image_det, j)
         
-    with open(os.path.join(output_folder, 'VAL' + '_GENOME_DETS_' + base_filename + '.json'), 'w') as j:
-        json.dump(val_image_det, j)
-        
-    with open(os.path.join(output_folder, 'TEST' + '_GENOME_DETS_' + base_filename + '.json'), 'w') as j:
-        json.dump(test_image_det, j)
+        # Sauvegarde des détections images
+        with open(os.path.join(output_folder, split_name + '_GENOME_DETS_' + base_filename + '.json'), 'w') as j:
+            json.dump(impaths, j)
 
-
+    # Traitement des différents splits
+    process_split(train_image_det, train_image_captions, 'TRAIN')
+    process_split(val_image_det, val_image_captions, 'VAL')
+    process_split(test_image_det, test_image_captions, 'TEST')
 
 def init_embedding(embeddings):
-    """
-    Fills embedding tensor with values from the uniform distribution.
+    """Initialisation des embeddings avec Xavier uniform pour les Transformers"""
+    nn.init.xavier_uniform_(embeddings.weight)
+    if embeddings.padding_idx is not None:
+        with torch.no_grad():
+            embeddings.weight[embeddings.padding_idx].fill_(0)
 
-    :param embeddings: embedding tensor
-    """
-    bias = np.sqrt(3.0 / embeddings.size(1))
-    torch.nn.init.uniform_(embeddings, -bias, bias)
-
-
-def save_checkpoint(data_name, epoch, epochs_since_improvement,decoder,decoder_optimizer,
-                    bleu4, is_best):
-    """
-    Saves model checkpoint.
-
-    :param data_name: base name of processed dataset
-    :param epoch: epoch number
-    :param epochs_since_improvement: number of epochs since last improvement in BLEU-4 score
-    :param decoder: decoder model
-    :param decoder_optimizer: optimizer to update decoder's weights
-    :param bleu4: validation BLEU-4 score for this epoch
-    :param is_best: is this checkpoint the best so far?
-    """
-    state = {'epoch': epoch,
-             'epochs_since_improvement': epochs_since_improvement,
-             'bleu-4': bleu4,
-             'decoder': decoder,
-             'decoder_optimizer': decoder_optimizer}
-    filename = 'checkpoint_' + data_name + '.pth.tar'
+def save_checkpoint(data_name, epoch, epochs_since_improvement, decoder, decoder_optimizer,
+                   scheduler, bleu4, is_best, checkpoint_dir='checkpoints'):
+    """Sauvegarde améliorée avec gestion du scheduler"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    state = {
+        'epoch': epoch,
+        'epochs_since_improvement': epochs_since_improvement,
+        'bleu-4': bleu4,
+        'decoder': decoder.state_dict(),
+        'decoder_optimizer': decoder_optimizer.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler else None,
+        'vocab_size': decoder.vocab_size,
+        'decoder_dim': decoder.decoder_dim,
+        'attention_dim': decoder.attention_dim,
+        'embed_dim': decoder.embed_dim,
+        'dropout': decoder.dropout
+    }
+    
+    filename = os.path.join(checkpoint_dir, f'checkpoint_{data_name}_epoch{epoch}.pth.tar')
     torch.save(state, filename)
-    # If this checkpoint is the best so far, store a copy so it doesn't get overwritten by a worse checkpoint
+    
     if is_best:
-        torch.save(state, 'BEST_' + str(epoch) + filename)
+        best_filename = os.path.join(checkpoint_dir, f'BEST_checkpoint_{data_name}.pth.tar')
+        torch.save(state, best_filename)
+        print(f"New best model saved to {best_filename}")
 
+def load_checkpoint(checkpoint_path, decoder, decoder_optimizer=None, scheduler=None):
+    """Chargement du checkpoint avec gestion des erreurs"""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    decoder.load_state_dict(checkpoint['decoder'])
+    
+    if decoder_optimizer is not None and 'decoder_optimizer' in checkpoint:
+        decoder_optimizer.load_state_dict(checkpoint['decoder_optimizer'])
+    
+    if scheduler is not None and 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    
+    return {
+        'epoch': checkpoint['epoch'],
+        'bleu4': checkpoint['bleu-4'],
+        'epochs_since_improvement': checkpoint['epochs_since_improvement']
+    }
 
-class AverageMeter(object):
-    """
-    Keeps track of most recent, average, sum, and count of a metric.
-    """
-
-    def __init__(self):
+class AverageMeter:
+    """Improved with smoothing and history tracking"""
+    def __init__(self, window_size=100):
         self.reset()
-
+        self.window_size = window_size
+        self.history = []
+        
     def reset(self):
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
-
+        self.history = []
+        
     def update(self, val, n=1):
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+        self.history.append(val)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+            
+    def smoothed_avg(self):
+        return np.mean(self.history) if self.history else 0
 
-
-def adjust_learning_rate(optimizer, shrink_factor):
-    """
-    Shrinks learning rate by a specified factor.
-
-    :param optimizer: optimizer whose learning rate must be shrunk.
-    :param shrink_factor: factor in interval (0, 1) to multiply learning rate with.
-    """
-
-    print("\nDECAYING learning rate.")
+def adjust_learning_rate(optimizer, shrink_factor, min_lr=1e-6):
+    """LR adjustment with minimum threshold"""
+    print(f"\nReducing learning rate by factor {shrink_factor}")
     for param_group in optimizer.param_groups:
-        param_group['lr'] = param_group['lr'] * shrink_factor
-    print("The new learning rate is %f\n" % (optimizer.param_groups[0]['lr'],))
+        new_lr = max(param_group['lr'] * shrink_factor, min_lr)
+        param_group['lr'] = new_lr
+    print(f"New learning rate: {optimizer.param_groups[0]['lr']:.2e}")
 
-
-def accuracy(scores, targets, k):
-    """
-    Computes top-k accuracy, from predicted and true labels.
-
-    :param scores: scores from the model
-    :param targets: true labels
-    :param k: k in top-k accuracy
-    :return: top-k accuracy
-    """
-
+def accuracy(scores, targets, k, ignore_index=-100):
+    """Top-k accuracy with ignore index support"""
     batch_size = targets.size(0)
     _, ind = scores.topk(k, 1, True, True)
-    correct = ind.eq(targets.view(-1, 1).expand_as(ind))
-    correct_total = correct.view(-1).float().sum()  # 0D tensor
-    return correct_total.item() * (100.0 / batch_size)
+    
+    # Create mask for valid targets
+    mask = targets != ignore_index
+    targets_masked = targets[mask]
+    ind_masked = ind[mask.repeat(1, k).view(-1, k)]
+    
+    if len(targets_masked) == 0:
+        return 0.0
+    
+    correct = ind_masked.eq(targets_masked.view(-1, 1).expand_as(ind_masked))
+    correct_total = correct.view(-1).float().sum()
+    return correct_total.item() * (100.0 / len(targets_masked))
+
+def create_masks(tgt, pad_idx):
+    """Create masks for Transformer decoder"""
+    # Mask pour le padding
+    tgt_pad_mask = (tgt == pad_idx)
+    
+    # Mask pour l'auto-régression
+    tgt_len = tgt.size(1)
+    tgt_sub_mask = torch.tril(torch.ones((tgt_len, tgt_len), diagonal=0).bool()
+    tgt_sub_mask = tgt_sub_mask.to(tgt.device)
+    
+    # Combine masks
+    tgt_mask = tgt_pad_mask.unsqueeze(1) | (~tgt_sub_mask)
+    
+    return tgt_pad_mask, tgt_mask
+
+def clip_gradient(optimizer, grad_clip):
+    """Clip gradients at specified value"""
+    for group in optimizer.param_groups:
+        for param in group['params']:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
+
+def set_seed(seed_value=42):
+    """Set seed for reproducibility"""
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed_value)
