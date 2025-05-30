@@ -263,7 +263,7 @@ def create_masks(tgt, pad_idx):
     return tgt_pad_mask, tgt_mask
 
 def clip_gradient(optimizer, grad_clip):
-    """Clip gradients at specified value""" 
+    """Clip gradients at specified value"""
     for group in optimizer.param_groups:
         for param in group['params']:
             if param.grad is not None:
